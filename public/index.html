@@ -93,7 +93,7 @@
     </div>
 
     <div class="card">
-      <strong>Phone alerts</strong>
+      <strong>Email alerts</strong>
       <div id="alerts"></div>
     </div>
 
@@ -204,7 +204,7 @@ async function load() {
   show(true);
   $('who').textContent = state.name;
   $('bal').textContent = state.balance == null ? state.reg : `${state.reg}  ·  Wallet Rs ${state.balance.toFixed(2)}`;
-  $('autoNote').textContent = `Checked every minute from 5:30 AM to 10:30 PM, and every 5 seconds around each meal's opening time, even when your phone and laptop are off. Each item is bought at most once a day.`;
+  $('autoNote').textContent = `Checked every minute from 5:30 AM to 10:30 PM, and every 10 seconds for the first 30 minutes of breakfast (6 AM), lunch (12 PM) and dinner (6 PM), even when your phone and laptop are off. Each item is bought at most once a day.`;
   $('tabs').innerHTML = '';
   for (const [id, name] of Object.entries(state.meals)) {
     const b = document.createElement('button');
@@ -238,7 +238,7 @@ async function loadMenu() {
   $('menu').innerHTML = '';
   const mname = state.meals[meal];
   $('menuNote').textContent = menuItems.length ? `Today's ${mname.toLowerCase()}`
-    : `${mname} isn't open right now${state.times[meal] ? ` (it runs ${state.t12(state.times[meal].start)}–${state.t12(state.times[meal].end)})` : ''}. Proodle only lists each meal during its serving time. Turn on Phone alerts below to get a notification the moment it opens, then tick what you want. Ticked items are bought automatically every day after that, within seconds of opening.`;
+    : `${mname} isn't open right now${state.times[meal] ? ` (it runs ${state.t12(state.times[meal].start)}–${state.t12(state.times[meal].end)})` : ''}. Proodle only lists each meal during its serving time. Turn on Email alerts below to hear the moment it opens, then tick what you want. Ticked items are bought automatically every day after that, within seconds of opening.`;
   for (const it of menuItems) {
     const el = document.createElement('div');
     el.className = 'item';
@@ -291,27 +291,25 @@ async function loadMenu() {
 
 function renderAlerts() {
   const box = $('alerts');
-  if (!state.alerts) {
-    box.innerHTML = '<p class="muted">Get a notification on your phone when each meal opens, and whenever something is auto-bought. Free, no signup.</p><button id="alOn">Turn on</button>';
-    $('alOn').onclick = () => setAlerts(true);
-    return;
-  }
-  box.innerHTML = `<ol class="muted" style="padding-left:18px;margin:8px 0">
-      <li>Install the free <b>ntfy</b> app: <a href="https://apps.apple.com/app/ntfy/id1625396347">iPhone</a> or <a href="https://play.google.com/store/apps/details?id=io.heckel.ntfy">Android</a>.</li>
-      <li>Open it, tap <b>+</b>, and subscribe to this topic (keep it private):</li>
-    </ol>
-    <p><code id="alTopic" style="font-size:16px;user-select:all"></code> <button class="ghost" id="alCopy">Copy</button></p>
-    <div class="row"><button class="ghost" id="alTest">Send test alert</button><button class="ghost" id="alOff">Turn off</button></div>
+  box.innerHTML = `<p class="muted" style="margin:4px 0 8px">Get an email when each meal opens, and whenever something is auto-bought for you.</p>
+    <div class="row"><input id="alEmail" type="email" inputmode="email" autocomplete="email" placeholder="you@gmail.com" class="grow">
+    <button id="alSave">${state.email ? 'Update' : 'Turn on'}</button></div>
+    ${state.email ? '<p class="row" style="margin-top:8px"><span class="muted grow">Sending to <b id="alTo"></b></span><button class="ghost" id="alOff">Turn off</button></p>' : ''}
     <p class="msg" id="alMsg"></p>`;
-  $('alTopic').textContent = state.alerts;
-  $('alCopy').onclick = () => navigator.clipboard?.writeText(state.alerts).then(() => { $('alMsg').textContent = 'Copied.'; }, () => {});
-  $('alTest').onclick = async () => { await setAlerts('test'); $('alMsg').textContent = 'Test sent. Did your phone get it?'; };
-  $('alOff').onclick = e => { if (armed(e.target, 'Tap again to turn off')) setAlerts(false); };
+  $('alEmail').value = state.email || '';
+  if (state.email) {
+    $('alTo').textContent = state.email;
+    $('alOff').onclick = e => { if (armed(e.target, 'Tap again to turn off')) setEmail(''); };
+  }
+  $('alSave').onclick = () => setEmail($('alEmail').value.trim());
 }
 
-async function setAlerts(on) {
-  try { state.alerts = (await api('/api/alerts', { on })).alerts; } catch (err) { $('alerts').textContent = err.message; return; }
-  renderAlerts();
+async function setEmail(email) {
+  try {
+    state.email = (await api('/api/email', { email })).email;
+    renderAlerts();
+    if (email) { $('alMsg').className = 'msg ok'; $('alMsg').textContent = 'Done. Check your inbox (and Spam, the first time) for a confirmation email.'; }
+  } catch (err) { $('alMsg').className = 'msg bad'; $('alMsg').textContent = err.message; }
 }
 
 function renderRules() {

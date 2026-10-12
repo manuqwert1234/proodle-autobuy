@@ -13,7 +13,7 @@ const DB = { prepare: sql => ({ bind: (...a) => ({
     throw new Error(sql);
   },
 }) }) };
-const env = { DB };
+const env = { DB, RUSH_UNTIL: 0, MAIL_URL: "https://mail.test/exec", MAIL_KEY: "mk" };
 
 const calls = [];
 const RAW = "\0raw:";
@@ -22,7 +22,10 @@ const item = { meitid: 7, meitdes: "Veg Meals", retrt: "60.00", skuid: 3, tb: "2
                dispname: "Rice, dal", itmsdes: "", odtdes: "LUNCH" };
 const alerts = [];
 globalThis.fetch = async (url, init = {}) => {
-  if (url.startsWith("https://ntfy.sh/")) { alerts.push(init.body); return new Response("{}"); }
+  if (url.startsWith("https://mail.test/")) {
+    const d = JSON.parse(init.body); assert.equal(d.key, "mk"); alerts.push(`${d.to}: ${d.subject} | ${d.body}`);
+    return new Response("ok");
+  }
   const path = new URL(url).pathname, body = init.body && JSON.parse(init.body);
   calls.push(path);
   await new Promise(r => setTimeout(r, 1)); // let overlapping runs interleave
@@ -106,17 +109,19 @@ await watch(env);
 assert.equal(pays(), 4);
 assert.match(log()[0], /bill B44/);
 
-// phone alerts: meal-open once a day, and every auto-buy
-const on = await (await req("/api/alerts", { on: true }, ck)).json();
-assert.match(on.alerts, /^proodle-[0-9a-f]{20}$/);
+// email alerts: meal-open once a day per meal, and every auto-buy
+const on = await (await req("/api/email", { email: "me@example.com" }, ck)).json();
+assert.equal(on.email, "me@example.com");
+assert.match(alerts.at(-1), /^me@example.com: Mess Auto-Buy alerts are on/);
+assert.equal((await req("/api/email", { email: "nope" }, ck)).status, 400);
 alerts.length = 0;
 for (const k of [...m.keys()]) if (k.includes(":done:")) m.delete(k);
 st.pay = "1|B45";
 await watch(env); await watch(env);
-assert.equal(alerts.filter(a => /Lunch is open: 1 items, e.g. Veg Meals/.test(a)).length, 1, alerts.join("|"));
-assert.equal(alerts.filter(a => /AUTO-BOUGHT Lunch/.test(a)).length, 1);
-assert.equal(alerts.filter(a => / is open: /.test(a)).length, 4);   // fake lists all 4 meals: one alert each, not repeated next minute
-assert.equal((await (await req("/api/alerts", { on: false }, ck)).json()).alerts, "");
+assert.equal(alerts.filter(a => /Lunch is open on Proodle .*Veg Meals/.test(a)).length, 1, alerts.join("\n"));
+assert.equal(alerts.filter(a => /Bought: Veg Meals .*AUTO-BOUGHT Lunch/.test(a)).length, 1);
+assert.equal(alerts.filter(a => / is open on Proodle/.test(a)).length, 4); // fake lists all 4 meals: one each, not repeated
+assert.equal((await (await req("/api/email", { email: "" }, ck)).json()).email, "");
 
 // renamed id: still found by name
 const u0 = JSON.parse(m.get("user:2023000000")); u0.rules[0].id = "999"; m.set("user:2023000000", JSON.stringify(u0));
@@ -135,7 +140,7 @@ assert.match(JSON.parse(m.get("times:9"))[2].start, /^\d\d:\d\d$/);
 assert.ok((await (await req("/api/state", null, ck)).json()).times[2].end);
 const p0 = pays();
 st.stockAfter = calls.filter(c => c === "/api/GetOptionMenuItems").length + 4;   // food appears a few checks later
-await watch({ DB, RUSH_EVERY: 1, RUSH_UNTIL: 500 });
+await watch({ DB, RUSH_EVERY: 1, RUSH_UNTIL: 500 });   // no email: rush is for the pending rule
 assert.equal(pays(), p0 + 1);                       // bought within the same minute, not on the next run
 st.stockAfter = 0; st.start = st.end = undefined;
 

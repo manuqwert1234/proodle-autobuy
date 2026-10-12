@@ -44,13 +44,21 @@ function note(u, msg) {
 
 // ---------- Proodle API ----------
 
+// Proodle only answers Indian IPs. Requests started by a user in India pass, but the cron looks like the
+// USA, so when RELAY_URL is set every call goes through a tiny relay running in Mumbai (relay/api/p.js).
+let ENV = {};
+
 async function call(path, body, query) {
-  const url = BASE + path + (query ? "?" + new URLSearchParams(query) : "");
   const init = { headers: { "Content-Type": "application/json; charset=utf-8", "User-Agent": "Mozilla/5.0" } };
   if (body !== undefined) Object.assign(init, { method: "POST", body: JSON.stringify(body) });
-  const r = await fetch(url, init);
+  const direct = () => fetch(BASE + path + (query ? "?" + new URLSearchParams(query) : ""), init);
+  const r = ENV.RELAY_URL
+    ? await fetch(ENV.RELAY_URL, { method: "POST", body: JSON.stringify({ path, query, body }),
+                                   headers: { "Content-Type": "application/json", "x-relay-key": ENV.RELAY_KEY } })
+        .catch(direct)                                                       // relay unreachable: try directly
+    : await direct();
   if (!r.ok) throw new Error(`Proodle ${path} answered HTTP ${r.status}`);
-  const text = (await r.text()).replace(/^﻿/, "");
+  const text = (await r.text()).replace(/^\uFEFF/, "");
   let out;
   try { out = text ? JSON.parse(text) : ""; } catch { out = text; } // orderQR answers with bare base64
   while (typeof out === "string" && /^[[{]/.test(out)) out = JSON.parse(out); // some endpoints double-encode
@@ -139,9 +147,11 @@ async function buy(env, u, meal, id, qty) {
 
 // ---------- auto-buy (every minute) ----------
 
-// Phone alert through the free ntfy app (user subscribes to their own random topic). Never throws.
-const notify = (u, text) => u.alerts
-  ? fetch("https://ntfy.sh/" + u.alerts, { method: "POST", body: text, headers: { Title: "Mess Auto-Buy" } }).catch(() => {})
+// Email alert, sent from the owner's Gmail by a small Apps Script web app (MAIL_URL + MAIL_KEY). Never throws.
+const notify = (u, subject, body = subject) => u.email && ENV.MAIL_URL
+  ? fetch(ENV.MAIL_URL, { method: "POST", body: JSON.stringify({ key: ENV.MAIL_KEY, to: u.email, subject,
+      body: body + "\n\nOpen Mess Auto-Buy: https://proodle-autobuy.proodle-autobuy.workers.dev" }) })
+      .then(r => r.text()).then(t => t === "ok" || console.log("mail", t.slice(0, 120))).catch(e => console.log("mail", e.message))
   : null;
 
 // Meal timetable: Proodle items carry StartTime/EndTime ("/Date(ms)/"). Only the open meal is listed,
@@ -169,69 +179,88 @@ function sinceStart(t) {
   return n.getUTCHours() * 3600 + n.getUTCMinutes() * 60 + n.getUTCSeconds() - (h * 3600 + m * 60);
 }
 
+// When food usually goes up (IST). Learned Proodle start times are used too, e.g. for snacks.
+const MEAL_STARTS = { 1: "06:00", 2: "12:00", 4: "18:00" };
+const RUSH_BEFORE = 120, RUSH_AFTER = 30 * 60;                         // seconds around a start time
+
 // Alert + auto-buy for one user and one meal, given that meal's current menu.
+// Returns how many things are still waiting (rules not bought yet, open-alert not sent yet).
 async function checkMeal(env, u, day, meal, list) {
   const reg = u.reg;
+  let pending = 0;
   const ready = list.filter(p => stock(p) > 0);
-  if (u.alerts && ready.length && await claim(env, `day:${day}:open:${reg}:${meal}`))   // "Dinner is open" once a day
-    await notify(u, `${MEALS[meal]} is open: ${ready.length} items, e.g. ${ready.slice(0, 3).map(p => p.meitdes).join(", ")}`);
+  if (u.email) {
+    if (!ready.length) pending++;
+    else if (await claim(env, `day:${day}:open:${reg}:${meal}`))      // "Lunch is open" once a day
+      await notify(u, `${MEALS[meal]} is open on Proodle`,
+        `${MEALS[meal]} is open: ${ready.length} items in stock, e.g. ${ready.slice(0, 5).map(p => p.meitdes).join(", ")}.`);
+  }
   for (const rule of (u.rules || []).filter(r => r.meal === meal)) {
     try {
       const p = list.find(p => String(p.meitid) === rule.id)         // by id, or by name if Proodle renumbered it
         || list.find(p => String(p.meitdes).trim().toLowerCase() === rule.name.trim().toLowerCase());
-      if (!p || stock(p) < rule.qty) continue;                         // not ready yet
+      if (!p || stock(p) < rule.qty) { pending++; continue; }          // not ready yet
       const key = `day:${day}:done:${reg}:${rule.meal}:${rule.id}`;
       if (!(await claim(env, key))) continue;                           // already bought today
       let msg;
       try {
         msg = `AUTO-BOUGHT ${MEALS[rule.meal]}: ${(await buy(env, u, rule.meal, p.meitid, rule.qty)).text}`;
       } catch (e) {
-        if (!(e instanceof Err) || e.retry) { await del(env, key); throw e; } // safe to try again shortly
+        if (!(e instanceof Err) || e.retry) { await del(env, key); pending++; throw e; } // try again shortly
         msg = `Auto-buy ${rule.name} stopped for today: ${e.message}`;
       }
       await update(env, reg, x => note(x, msg));
-      await notify(u, msg);
+      await notify(u, msg.startsWith("AUTO") ? `Bought: ${rule.name}` : `Auto-buy failed: ${rule.name}`,
+                   msg + (msg.startsWith("AUTO") ? "\n\nYour pickup QR is under My orders." : ""));
     } catch (e) {
       console.log("watch", reg, rule.name, e.message);
     }
   }
+  return pending;
 }
 
 export async function watch(env, t0 = Date.now()) {
-  const RUSH_EVERY = env.RUSH_EVERY ?? 5000, RUSH_UNTIL = env.RUSH_UNTIL ?? 50000;
+  ENV = env;
+  const RUSH_EVERY = env.RUSH_EVERY ?? 10000, RUSH_UNTIL = env.RUSH_UNTIL ?? 50000;
   const { day } = today();
   await env.DB.prepare("DELETE FROM kv WHERE k LIKE 'day:%' AND k < ?").bind("day:" + day).run();
-  const rush = [];                                                      // [user, meal] near opening time
+  let rush = [];                                                        // [user, meal] near a start time
   for (const reg of (await get(env, "users")) || []) {
     const u = await get(env, "user:" + reg);
-    if (!u || (!u.rules?.length && !u.alerts)) continue;
+    if (!u || (!u.rules?.length && !u.email)) continue;
     const times = u.s ? (await get(env, "times:" + u.s.P2)) || {} : {};
-    const meals = u.alerts ? [1, 2, 3, 4] : [...new Set(u.rules.map(r => r.meal))];
+    const meals = u.email ? [1, 2, 3, 4] : [...new Set(u.rules.map(r => r.meal))];
     for (const meal of meals) {
       try {
         const list = await rawMenu(env, u, meal);
         if (list.length) await learn(env, u, meal, list);
-        await checkMeal(env, u, day, meal, list);
-        const t = sinceStart(times[meal]);
-        if (t !== null && t >= -60 && t <= 120) rush.push([u, meal]);
+        const pending = await checkMeal(env, u, day, meal, list);
+        const near = [MEAL_STARTS[meal], times[meal]?.start].some(st => {
+          const t = sinceStart(st && { start: st });
+          return t !== null && t >= -RUSH_BEFORE && t <= RUSH_AFTER;
+        });
+        if (pending && near) rush.push([u, meal]);
       } catch (e) {
         console.log("watch meal", reg, meal, e.message);
       }
     }
   }
-  // Cloudflare starts us once a minute. Around a meal's opening time, keep re-checking every few
-  // seconds for the rest of this minute so ticked items are bought within seconds of opening.
-  // ponytail: ~10 Proodle calls per rushing user per minute; free plan allows 50 per run, so a
-  // handful of users rush fine; with many users split the run per user (service binding / queue).
+  // Cloudflare starts us once a minute. Around meal start times keep re-checking every 10 s for the
+  // rest of the minute, so ticked food is bought (and the alert sent) within seconds of going up.
+  // ponytail: ~6 Proodle calls per rushing user per minute; free plan allows 50 per run, so a handful
+  // of users rush fine; with many users split the run per user (service binding / queue).
   while (rush.length && Date.now() - t0 < RUSH_UNTIL) {
     await new Promise(r => setTimeout(r, RUSH_EVERY));
+    const still = [];
     for (const [u, meal] of rush) {
       try {
-        await checkMeal(env, u, day, meal, await rawMenu(env, u, meal));
+        if (await checkMeal(env, u, day, meal, await rawMenu(env, u, meal))) still.push([u, meal]);
       } catch (e) {
         console.log("rush", u.reg, meal, e.message);
+        still.push([u, meal]);
       }
     }
+    rush = still;
   }
 }
 
@@ -283,7 +312,7 @@ async function route(req, env) {
 
   if (path === "/api/state")
     return json({ name: u.s?.P5 || u.reg, reg: u.reg, balance: await balance(u).catch(() => null),
-                  rules: u.rules || [], log: u.log || [], meals: MEALS, poll: 60, alerts: u.alerts || "",
+                  rules: u.rules || [], log: u.log || [], meals: MEALS, poll: 60, email: u.email || "",
                   times: u.s ? (await get(env, "times:" + u.s.P2)) || {} : {} });
   if (path === "/api/menu") {
     const meal = Number(q.meal) || 1, list = await rawMenu(env, u, meal);
@@ -324,11 +353,13 @@ async function route(req, env) {
     await update(env, reg, x => { x.rules = rules; });
     return json({ ok: true });
   }
-  if (path === "/api/alerts") { // on: make a private random topic; off: forget it
-    const topic = q.on ? (u.alerts || "proodle-" + crypto.randomUUID().replace(/-/g, "").slice(0, 20)) : "";
-    await update(env, reg, x => { x.alerts = topic; });
-    if (topic) await notify({ alerts: topic }, q.on === "test" ? "Test alert from Mess Auto-Buy" : "Alerts are on. You'll hear when each meal opens and when something is auto-bought.");
-    return json({ ok: true, alerts: topic });
+  if (path === "/api/email") { // email alerts on (address) / off ("")
+    const email = String(q.email || "").trim().slice(0, 120);
+    if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return json({ error: "That email address looks wrong" }, 400);
+    await update(env, reg, x => { x.email = email; delete x.alerts; });
+    if (email) await notify({ email }, "Mess Auto-Buy alerts are on",
+      "You'll get an email when each meal opens on Proodle, and whenever something is auto-bought for you.");
+    return json({ ok: true, email });
   }
   if (path === "/api/forget") { // sign out + delete stored PIN and rules
     await del(env, "user:" + reg);
@@ -341,6 +372,7 @@ async function route(req, env) {
 
 export default {
   async fetch(req, env) {
+    ENV = env;
     try {
       return await route(req, env);
     } catch (e) {
@@ -350,6 +382,7 @@ export default {
     }
   },
   async scheduled(event, env, ctx) {
+    ENV = env;
     ctx.waitUntil(watch(env));
   },
 };
