@@ -154,21 +154,24 @@ async function showQR(id) {
   $('qrTitle').textContent = 'Loading QR...';
   $('qrWho').textContent = $('qrItems').textContent = '';
   $('qrImg').removeAttribute('src');
+  $('qrImg').classList.add('hide');
   window.scrollTo(0, 0);
   try {
     const q = await api('/api/qr?id=' + encodeURIComponent(id));
     $('qrTitle').textContent = `${q.meal || ''}  ·  ${q.status || ''}`;
     $('qrWho').textContent = `${q.name || ''}  ·  ${q.reg || ''}  ·  ${q.date || ''}`;
     $('qrImg').src = 'data:image/png;base64,' + q.img;
+    $('qrImg').classList.remove('hide');
     $('qrItems').textContent = q.items.map(i => `${i.qty} x ${i.name}  Rs ${i.total}`).join('   ·   ');
     clearInterval(clock);
     const tick = () => { $('qrClock').textContent = new Date().toLocaleString('en-GB'); };
     tick(); clock = setInterval(tick, 1000);
-  } catch (err) { $('qrTitle').textContent = err.message; }
+    return true;
+  } catch (err) { $('qrTitle').textContent = err.message; return false; }
 }
 $('qrClose').onclick = () => { $('qrView').classList.add('hide'); clearInterval(clock); };
 
-async function loadOrders(openNewest) {
+async function loadOrders() {
   $('orders').innerHTML = '<p class="muted">Loading...</p>';
   let list;
   try { list = await api('/api/orders'); }
@@ -187,8 +190,6 @@ async function loadOrders(openNewest) {
     }
     $('orders').append(el);
   }
-  const newest = list.find(o => o.qr);
-  if (openNewest && newest) showQR(newest.id);
 }
 $('ordRefresh').onclick = () => loadOrders();
 
@@ -251,7 +252,11 @@ async function loadMenu() {
         const r = await api('/api/buy', { meal, id: it.id, qty: n });
         msg.className = 'msg ok';
         msg.textContent = 'Order placed: ' + r.receipt;
-        loadOrders(true);
+        loadOrders();
+        if (!(await showQR(r.order))) { // order list ids may differ from the order number: open the newest order instead
+          const ids = (await api('/api/orders')).filter(o => o.qr).map(o => BigInt(o.id));
+          if (ids.length) showQR(String(ids.reduce((a, b) => (b > a ? b : a))));
+        }
         const s = await api('/api/state');
         $('bal').textContent = `${s.reg}  ·  Wallet Rs ${(s.balance || 0).toFixed(2)}`;
       } catch (err) {

@@ -109,7 +109,7 @@ async function balance(u) {
   return Array.isArray(r) && r.length ? Number(r[0].bal) : null;
 }
 
-// Same steps as the site: order id -> GST -> insert cart -> wallet pay. Returns a receipt string.
+// Same steps as the site: order id -> GST -> insert cart -> wallet pay. Returns { text, order }.
 async function buy(env, u, meal, id, qty) {
   const s = await session(env, u, true);
   const p = (await rawMenu(env, u, meal)).find(p => String(p.meitid) === String(id));
@@ -135,7 +135,7 @@ async function buy(env, u, meal, id, qty) {
     throw new Err(`No reply from payment for order ${order}. Check My Orders on Proodle.`);
   }
   const [code, bill] = r.split("|");
-  if (code === "1") return `${qty} x ${p.meitdes}, Rs ${net}, bill ${bill}`;
+  if (code === "1") return { text: `${qty} x ${p.meitdes}, Rs ${net}, bill ${bill}`, order: String(order) };
   throw new Err(PAY_ERR[code] || `Order ${order} not processed (${r})`, code === "9");
 }
 
@@ -157,7 +157,7 @@ export async function watch(env) {
         if (!(await claim(env, key))) continue;                         // already bought today
         let msg;
         try {
-          msg = `AUTO-BOUGHT ${MEALS[rule.meal]}: ${await buy(env, u, rule.meal, rule.id, rule.qty)}`;
+          msg = `AUTO-BOUGHT ${MEALS[rule.meal]}: ${(await buy(env, u, rule.meal, rule.id, rule.qty)).text}`;
         } catch (e) {
           if (!(e instanceof Err) || e.retry) { await del(env, key); throw e; } // safe to try again next minute
           msg = `Auto-buy ${rule.name} stopped for today: ${e.message}`;
@@ -217,9 +217,9 @@ async function route(req, env) {
   if (path === "/api/buy") {
     const meal = Number(q.meal), qty = Math.max(1, Math.min(5, parseInt(q.qty) || 1));
     try {
-      const receipt = await buy(env, u, meal, q.id, qty);
-      await update(env, reg, x => note(x, `Bought ${MEALS[meal]}: ${receipt}`));
-      return json({ ok: true, receipt });
+      const r = await buy(env, u, meal, q.id, qty);
+      await update(env, reg, x => note(x, `Bought ${MEALS[meal]}: ${r.text}`));
+      return json({ ok: true, receipt: r.text, order: r.order });
     } catch (e) {
       await update(env, reg, x => note(x, `Buy failed (${MEALS[meal]}): ${e.message}`));
       throw e;
