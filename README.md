@@ -4,8 +4,10 @@ A faster front end for VIT Proodle. Sign in with your registration number and PI
 breakfast, lunch, snacks and dinner with live stock, buy in one tap, or tick items to
 **auto-buy the moment they are in stock**.
 
-Runs free on Cloudflare Workers. A 1-minute schedule (05:30 to 22:30 IST) does the auto-buying,
-so your phone and laptop can be off.
+Runs free on Cloudflare Workers. Proodle only answers requests that start from a real device in India
+(cloud servers and Cloudflare's own scheduler are refused), so the checking is driven by pings to
+`/internal/tick?k=<TICK_KEY>` from someone's phone or laptop: iOS Shortcuts automations at meal times,
+a laptop, or an old Android phone on charge. Each ping checks every 10 s for ~40 s, for everyone.
 
 - Each auto-buy item is bought at most once a day. Overlapping runs can't double-buy.
 - A failed payment (wrong PIN, low balance) stops that item for the day instead of retrying.

@@ -1,6 +1,6 @@
 // VIT Proodle auto-buyer on Cloudflare Workers.
 // The site (public/index.html) shows today's menu with live stock, buys in one tap,
-// and lets you tick items to auto-buy. A 1-minute cron buys them the moment they are in stock.
+// and lets you tick items to auto-buy. Pings to /internal/tick (from a phone/laptop in India) do the checking.
 // Storage: one D1 table kv(k, v). Keys: users, user:<reg>, tok:<token>,
 // day:<day>:done:<reg>:<meal>:<item> (bought today), day:<day>:open:<reg>:<meal> (open alert sent today),
 // times:<outlet> (learned meal start/end times).
@@ -44,19 +44,15 @@ function note(u, msg) {
 
 // ---------- Proodle API ----------
 
-// Proodle only answers Indian IPs. Requests started by a user in India pass, but the cron looks like the
-// USA, so when RELAY_URL is set every call goes through a tiny relay running in Mumbai (relay/api/p.js).
+// Proodle (behind Cloudflare bot protection) only answers requests that start from a real device in India.
+// Requests started by a user's tap carry their device's address and pass; the cron and cloud servers don't.
+// So background checks are driven by /internal/tick, pinged from someone's phone (iOS Shortcuts) or laptop.
 let ENV = {};
 
 async function call(path, body, query) {
   const init = { headers: { "Content-Type": "application/json; charset=utf-8", "User-Agent": "Mozilla/5.0" } };
   if (body !== undefined) Object.assign(init, { method: "POST", body: JSON.stringify(body) });
-  const direct = () => fetch(BASE + path + (query ? "?" + new URLSearchParams(query) : ""), init);
-  const r = ENV.RELAY_URL
-    ? await fetch(ENV.RELAY_URL, { method: "POST", body: JSON.stringify({ path, query, body }),
-                                   headers: { "Content-Type": "application/json", "x-relay-key": ENV.RELAY_KEY } })
-        .catch(direct)                                                       // relay unreachable: try directly
-    : await direct();
+  const r = await fetch(BASE + path + (query ? "?" + new URLSearchParams(query) : ""), init);
   if (!r.ok) throw new Error(`Proodle ${path} answered HTTP ${r.status}`);
   const text = (await r.text()).replace(/^\uFEFF/, "");
   let out;
@@ -225,6 +221,7 @@ export async function watch(env, t0 = Date.now()) {
   const { day } = today();
   await env.DB.prepare("DELETE FROM kv WHERE k LIKE 'day:%' AND k < ?").bind("day:" + day).run();
   let rush = [];                                                        // [user, meal] near a start time
+  const open = new Set();
   for (const reg of (await get(env, "users")) || []) {
     const u = await get(env, "user:" + reg);
     if (!u || (!u.rules?.length && !u.email)) continue;
@@ -234,6 +231,7 @@ export async function watch(env, t0 = Date.now()) {
       try {
         const list = await rawMenu(env, u, meal);
         if (list.length) await learn(env, u, meal, list);
+        if (list.some(p => stock(p) > 0)) open.add(MEALS[meal]);
         const pending = await checkMeal(env, u, day, meal, list);
         const near = [MEAL_STARTS[meal], times[meal]?.start].some(st => {
           const t = sinceStart(st && { start: st });
@@ -245,7 +243,14 @@ export async function watch(env, t0 = Date.now()) {
       }
     }
   }
-  // Cloudflare starts us once a minute. Around meal start times keep re-checking every 10 s for the
+  if (!open.size) { // nobody needed a full check: still report honestly what's open, using any signed-in user
+    const any = await get(env, "user:" + ((await get(env, "users")) || [])[0]);
+    if (any?.s) for (const meal of [1, 2, 3, 4]) {
+      const list = await rawMenu(env, any, meal).catch(() => []);
+      if (list.some(p => stock(p) > 0)) { open.add(MEALS[meal]); await learn(env, any, meal, list); }
+    }
+  }
+  // Pings arrive about once a minute. Around meal start times keep re-checking every 10 s for the
   // rest of the minute, so ticked food is bought (and the alert sent) within seconds of going up.
   // ponytail: ~6 Proodle calls per rushing user per minute; free plan allows 50 per run, so a handful
   // of users rush fine; with many users split the run per user (service binding / queue).
@@ -262,6 +267,7 @@ export async function watch(env, t0 = Date.now()) {
     }
     rush = still;
   }
+  return [...open];
 }
 
 // ---------- web routes ----------
@@ -373,6 +379,13 @@ async function route(req, env) {
 export default {
   async fetch(req, env) {
     ENV = env;
+    const url = new URL(req.url);
+    if (url.pathname === "/internal/tick") { // pinged by a phone/laptop in India; see README
+      if (!env.TICK_KEY || url.searchParams.get("k") !== env.TICK_KEY) return json({ error: "Not found" }, 404);
+      const open = await watch({ ...env, RUSH_UNTIL: 40000 }).catch(e => (console.log("tick", e.message), null));
+      return new Response(open === null ? "Check failed, will retry"
+        : open.length ? `Open now: ${open.join(", ")}` : "Checked: nothing open yet", { headers: { "Content-Type": "text/plain" } });
+    }
     try {
       return await route(req, env);
     } catch (e) {
@@ -380,9 +393,5 @@ export default {
       console.log("error", e.stack);
       return json({ error: `Proodle error: ${e.message}` }, 502);
     }
-  },
-  async scheduled(event, env, ctx) {
-    ENV = env;
-    ctx.waitUntil(watch(env));
   },
 };
