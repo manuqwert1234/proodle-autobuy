@@ -71,7 +71,7 @@ async function login(env, u) {
     const st = String(r[0].OtpSts || "").split("|");
     if (st[0] === "Success") {
       u.s = { P1: u.reg, P2: r[0].ouid, P5: st[5], P6: st[6], P9: r[0].ctrid, P10: r[0].logid };
-      await update(env, u.reg, x => { x.s = u.s; }); // reuse it, so we don't re-login every minute
+      await update(env, u.reg, x => { x.s = u.s; });
       return u.s;
     }
     if (st[0] === "duplicate") { await call("/api/ulogout", { mobno: st[6] }); continue; } // the site's "close other session? Yes"
@@ -80,14 +80,10 @@ async function login(env, u) {
   throw new Err("Could not close your other Proodle session");
 }
 
-async function session(env, u, fresh = false) {
-  let s = u.s;
-  if (s && fresh) {
-    const alive = await call("/api/chkuserstat", { mobno: s.P6, logid: s.P10 }).then(r => String(r) !== "0", () => false);
-    if (!alive) s = null;
-  }
-  return s || login(env, u);
-}
+// Proodle allows one login per person, and logging in closes the phone app's session.
+// Menu, orders and payment only need the saved account ids (+ PIN for paying), not a live session,
+// so we log in once at sign-in and never again in the background: nobody gets kicked out.
+const session = (env, u) => u.s || login(env, u);
 
 async function rawMenu(env, u, meal) {
   const s = await session(env, u);
@@ -112,7 +108,7 @@ async function balance(u) {
 
 // Same steps as the site: order id -> GST -> insert cart -> wallet pay. Returns { text, order }.
 async function buy(env, u, meal, id, qty) {
-  const s = await session(env, u, true);
+  const s = await session(env, u);
   const p = (await rawMenu(env, u, meal)).find(p => String(p.meitid) === String(id));
   if (!p) throw new Err("Item not on today's menu", true);
   if (stock(p) < qty) throw new Err("Not in stock yet", true);
@@ -206,14 +202,22 @@ async function route(req, env) {
   if (path === "/api/login") {
     const reg = String(q.reg || "").trim(), pin = String(q.pin || "").trim();
     if (!/^\d+$/.test(reg) || !/^\d+$/.test(pin)) return json({ error: "Enter your registration number and PIN" }, 400);
-    const u = { rules: [], log: [], ...(await get(env, "user:" + reg)), reg, pin, wpin: String(q.wpin || "").trim() };
-    delete u.s;
-    await put(env, "user:" + reg, u);
-    try {
-      await login(env, u);
-    } catch (e) {
-      if (!u.rules.length) await del(env, "user:" + reg); // don't keep a wrong PIN for a brand-new user
-      throw e;
+    const old = await get(env, "user:" + reg);
+    const wpin = String(q.wpin || "").trim();
+    if (old?.s && old.pin === pin) {
+      // already signed in before with this same (Proodle-verified) PIN: no new Proodle login, so the app isn't kicked
+      if (wpin) await update(env, reg, x => { x.wpin = wpin; });
+    } else {
+      const u = { rules: [], log: [], ...old, reg, pin, wpin };
+      delete u.s;
+      await put(env, "user:" + reg, u);
+      try {
+        await login(env, u);
+      } catch (e) {
+        if (old) await put(env, "user:" + reg, old);  // keep the working setup on a wrong PIN
+        else await del(env, "user:" + reg);           // don't keep a wrong PIN for a brand-new user
+        throw e;
+      }
     }
     const users = (await get(env, "users")) || [];
     if (!users.includes(reg)) await put(env, "users", [...users, reg]);

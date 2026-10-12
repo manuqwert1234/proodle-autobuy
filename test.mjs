@@ -30,7 +30,6 @@ globalThis.fetch = async (url, init = {}) => {
     "/api/GetOTPChecking": () => body.OtpNo === "1234"
       ? JSON.stringify([{ OtpSts: "Success|0|x|x|x|NAME|M123|5", ouid: 9, ctrid: 1, logid: 5 }]) // double-encoded, like the real API
       : [{ OtpSts: "Fail" }],
-    "/api/chkuserstat": () => 1,
     "/api/GetOptionMenuItems": () => (assert.match(body.odt, /^\d\d-[A-Z][a-z]{2}-\d{4}$/), [{ ...item, StockQty: st.stock }]),
     "/api/getexgstval": () => 3,
     "/api/GetOrderIdDetails": () => [{ OrderNo: "O1" }],
@@ -69,6 +68,15 @@ assert.equal((await (await req("/api/state", null, ck)).json()).balance, 500);
 assert.equal((await req("/api/state", null, "pt=nope")).status, 401);
 const logins = calls.filter(c => c === "/api/GetOTPChecking").length;
 
+// signing in again (another device) with the same PIN: no new Proodle login, so the phone app isn't kicked
+r = await req("/api/login", { reg: "2023000000", pin: "1234" });
+assert.equal(r.status, 200);
+assert.equal(calls.filter(c => c === "/api/GetOTPChecking").length, logins);
+// a wrong PIN later is rejected and doesn't break the saved setup
+assert.equal((await req("/api/login", { reg: "2023000000", pin: "9999" })).status, 400);
+assert.equal(JSON.parse(m.get("user:2023000000")).pin, "1234");
+const logins2 = calls.filter(c => c === "/api/GetOTPChecking").length;
+
 await watch(env);                                   // out of stock: nothing bought
 assert.equal(pays(), 0);
 st.stock = 5;
@@ -77,7 +85,8 @@ assert.equal(pays(), 1);
 assert.match(log()[0], /AUTO-BOUGHT Lunch: 2 x Veg Meals, Rs 123.00, bill B42/);
 await watch(env);                                   // same day: never again
 assert.equal(pays(), 1);
-assert.equal(calls.filter(c => c === "/api/GetOTPChecking").length, logins); // session reused, no re-login
+assert.equal(calls.filter(c => c === "/api/GetOTPChecking").length, logins2); // never logs in again in the background
+assert.ok(!calls.includes("/api/ulogout") && !calls.includes("/api/chkuserstat"));  // so it never kicks the phone app
 
 for (const k of [...m.keys()]) if (k.includes(":done:")) m.delete(k);
 st.pay = "6|";
