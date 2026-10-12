@@ -49,7 +49,8 @@ async function call(path, body, query) {
   const r = await fetch(url, init);
   if (!r.ok) throw new Error(`Proodle ${path} answered HTTP ${r.status}`);
   const text = (await r.text()).replace(/^﻿/, "");
-  let out = text ? JSON.parse(text) : "";
+  let out;
+  try { out = text ? JSON.parse(text) : ""; } catch { out = text; } // orderQR answers with bare base64
   while (typeof out === "string" && /^[[{]/.test(out)) out = JSON.parse(out); // some endpoints double-encode
   return out;
 }
@@ -96,6 +97,12 @@ async function rawMenu(env, u, meal) {
 }
 
 const stock = p => Math.trunc(Number(p.StockQty) || 0);
+
+async function orders(env, u) { // same list as Proodle's My Orders page
+  const s = await session(env, u);
+  const r = await call("/api/GetOrderList", { MobileNo: s.P6 });
+  return Array.isArray(r) ? r : [];
+}
 
 async function balance(u) {
   const r = await call("/api/getstudWBalinfo", undefined, { rno: u.reg });
@@ -209,9 +216,29 @@ async function route(req, env) {
       id: String(p.meitid), name: p.meitdes, price: Number(p.retrt), stock: stock(p), info: p.dispname || "" })));
   if (path === "/api/buy") {
     const meal = Number(q.meal), qty = Math.max(1, Math.min(5, parseInt(q.qty) || 1));
-    const receipt = await buy(env, u, meal, q.id, qty);
-    await update(env, reg, x => note(x, `Bought ${MEALS[meal]}: ${receipt}`));
-    return json({ ok: true, receipt });
+    try {
+      const receipt = await buy(env, u, meal, q.id, qty);
+      await update(env, reg, x => note(x, `Bought ${MEALS[meal]}: ${receipt}`));
+      return json({ ok: true, receipt });
+    } catch (e) {
+      await update(env, reg, x => note(x, `Buy failed (${MEALS[meal]}): ${e.message}`));
+      throw e;
+    }
+  }
+  if (path === "/api/orders")
+    return json((await orders(env, u)).slice(0, 20).map(o => ({
+      id: String(o.OrderId), meal: o.sname, status: o.Status, qr: Number(o.qrstat) > 0,
+      amount: o.NetAmount, date: o.OrderDate })));
+  if (path === "/api/qr") {
+    const o = (await orders(env, u)).find(o => String(o.OrderId) === String(q.id)); // only your own orders
+    if (!o) return json({ error: "Order not found" }, 404);
+    const [img, items] = await Promise.all([
+      call("/api/orderQR", undefined, { ordno: String(o.OrderId) }),
+      call("/api/GetStudordItemdet", { MobileNo: String(o.OrderId) }).catch(() => []),
+    ]);
+    if (typeof img !== "string" || img.length < 100) return json({ error: "Proodle has no QR for this order yet" }, 404);
+    return json({ img, name: o.studname, reg: o.RegNo, meal: o.sname, date: o.OrderDate, status: o.Status,
+                  items: (Array.isArray(items) ? items : []).map(i => ({ name: i.itmdes, qty: i.pqty, total: i.itot })) });
   }
   if (path === "/api/rules") {
     const rules = (q.rules || []).filter(r => MEALS[r.meal]).map(r => ({

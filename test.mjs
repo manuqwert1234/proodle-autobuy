@@ -16,6 +16,7 @@ const DB = { prepare: sql => ({ bind: (...a) => ({
 const env = { DB };
 
 const calls = [];
+const RAW = "\0raw:";
 const st = { stock: 0, pay: "1|B42" };
 const item = { meitid: 7, meitdes: "Veg Meals", retrt: "60.00", skuid: 3, tb: "2", type: "V",
                dispname: "Rice, dal", itmsdes: "", odtdes: "LUNCH" };
@@ -36,9 +37,15 @@ globalThis.fetch = async (url, init = {}) => {
     },
     "/api/OnlineWPayment": () => { assert.equal(body.Otp, "1234"); assert.equal(body.OrderAmount, "123.00"); return st.pay; },
     "/api/getstudWBalinfo": () => [{ bal: "500" }],
+    "/api/GetOrderList": () => (assert.equal(body.MobileNo, "M123"),
+      [{ OrderId: 55, sname: "LUNCH", Status: "Success", qrstat: 1, NetAmount: "123.00", OrderDate: "12-Oct-2026",
+         studname: "NAME", RegNo: "2023000000" }]),
+    "/api/orderQR": () => RAW + "iVBORw0KGgo".repeat(20),                // bare base64, not JSON
+    "/api/GetStudordItemdet": () => [{ itmdes: "Veg Meals", pqty: 2, itot: "120" }],
   }[path];
   if (!out) throw new Error("unexpected " + path);
-  return new Response(JSON.stringify(out()));
+  const v = out();
+  return new Response(typeof v === "string" && v.startsWith(RAW) ? v.slice(RAW.length) : JSON.stringify(v));
 };
 
 const req = (path, body, cookie) => worker.fetch(new Request("https://x" + path, {
@@ -83,6 +90,18 @@ st.pay = "1|B44";
 await watch(env);
 assert.equal(pays(), 4);
 assert.match(log()[0], /bill B44/);
+
+// My orders + QR (only your own orders)
+const ords = await (await req("/api/orders", null, ck)).json();
+assert.deepEqual(ords[0], { id: "55", meal: "LUNCH", status: "Success", qr: true, amount: "123.00", date: "12-Oct-2026" });
+const qr = await (await req("/api/qr?id=55", null, ck)).json();
+assert.ok(qr.img.startsWith("iVBOR") && qr.items[0].name === "Veg Meals", JSON.stringify(qr));
+assert.equal((await req("/api/qr?id=99", null, ck)).status, 404);
+
+// a failed manual buy is written to Activity
+st.stock = 0;
+assert.equal((await req("/api/buy", { meal: 2, id: "7", qty: 1 }, ck)).status, 400);
+assert.match(log()[0], /Buy failed \(Lunch\): Not in stock yet/);
 
 assert.equal((await req("/api/forget", {}, ck)).status, 200);
 assert.ok(!m.has("user:2023000000"));

@@ -33,6 +33,13 @@
   .auto input { width:auto; }
   #log div { font-size:13px; padding:4px 0; border-top:1px solid var(--line); font-variant-numeric:tabular-nums; }
   .hide { display:none; }
+  button.confirm { background:#b8860b; }
+  .msg { font-size:13px; margin-top:6px; }
+  .msg.ok { color:var(--accent); }
+  .msg.bad { color:var(--bad); }
+  #qrView { text-align:center; }
+  #qrView img { width:240px; height:240px; background:#fff; padding:8px; border-radius:8px; image-rendering:pixelated; }
+  #qrClock { font-size:20px; font-weight:600; font-variant-numeric:tabular-nums; margin:6px 0; }
 </style>
 </head>
 <body>
@@ -58,10 +65,24 @@
       <button class="ghost" id="logout">Sign out</button>
     </div>
 
+    <div class="card hide" id="qrView">
+      <strong id="qrTitle"></strong>
+      <div class="muted" id="qrWho"></div>
+      <p><img id="qrImg" alt="Order QR code"></p>
+      <div id="qrClock"></div>
+      <div class="muted" id="qrItems"></div>
+      <p><button class="ghost" id="qrClose">Close</button></p>
+    </div>
+
     <div class="tabs" id="tabs"></div>
     <div class="card">
       <div class="muted" id="menuNote"></div>
       <div id="menu"></div>
+    </div>
+
+    <div class="card">
+      <div class="row"><strong class="grow">My orders</strong><button class="ghost" id="ordRefresh">Refresh</button></div>
+      <div id="orders"></div>
     </div>
 
     <div class="card">
@@ -105,15 +126,71 @@ $('loginForm').onsubmit = async e => {
     await api('/api/login', { reg: $('reg').value, pin: $('pin').value, wpin: $('wpin').value });
     $('pin').value = $('wpin').value = '';
     await load();
+    loadOrders();
   } catch (err) { $('loginErr').textContent = err.message; }
   $('loginBtn').disabled = false;
 };
 
-$('logout').onclick = async () => {
-  if (!confirm('Sign out and delete your saved PIN and auto-buy items?')) return;
+// Two-tap confirm on the button itself (browser confirm() popups are blocked in some in-app browsers)
+function armed(btn, label) {
+  if (btn.dataset.armed) return true;
+  const orig = btn.textContent;
+  btn.dataset.armed = '1';
+  btn.textContent = label;
+  btn.classList.add('confirm');
+  setTimeout(() => { delete btn.dataset.armed; btn.textContent = orig; btn.classList.remove('confirm'); }, 4000);
+  return false;
+}
+
+$('logout').onclick = async e => {
+  if (!armed(e.target, 'Tap again to sign out')) return;
   await api('/api/forget', {});
   show(false);
 };
+
+let clock;
+async function showQR(id) {
+  $('qrView').classList.remove('hide');
+  $('qrTitle').textContent = 'Loading QR...';
+  $('qrWho').textContent = $('qrItems').textContent = '';
+  $('qrImg').removeAttribute('src');
+  window.scrollTo(0, 0);
+  try {
+    const q = await api('/api/qr?id=' + encodeURIComponent(id));
+    $('qrTitle').textContent = `${q.meal || ''}  ·  ${q.status || ''}`;
+    $('qrWho').textContent = `${q.name || ''}  ·  ${q.reg || ''}  ·  ${q.date || ''}`;
+    $('qrImg').src = 'data:image/png;base64,' + q.img;
+    $('qrItems').textContent = q.items.map(i => `${i.qty} x ${i.name}  Rs ${i.total}`).join('   ·   ');
+    clearInterval(clock);
+    const tick = () => { $('qrClock').textContent = new Date().toLocaleString('en-GB'); };
+    tick(); clock = setInterval(tick, 1000);
+  } catch (err) { $('qrTitle').textContent = err.message; }
+}
+$('qrClose').onclick = () => { $('qrView').classList.add('hide'); clearInterval(clock); };
+
+async function loadOrders(openNewest) {
+  $('orders').innerHTML = '<p class="muted">Loading...</p>';
+  let list;
+  try { list = await api('/api/orders'); }
+  catch (err) { $('orders').innerHTML = ''; $('orders').append(Object.assign(document.createElement('p'), { className: 'msg bad', textContent: err.message })); return; }
+  $('orders').innerHTML = list.length ? '' : '<p class="muted">No orders yet.</p>';
+  for (const o of list) {
+    const el = document.createElement('div');
+    el.className = 'item row';
+    el.innerHTML = '<div class="grow"><div class="n"></div><div class="muted i"></div></div>';
+    el.querySelector('.n').textContent = `${o.meal}  ·  ${o.status}`;
+    el.querySelector('.i').textContent = `Rs ${o.amount}  ·  ${o.date}  ·  #${o.id}`;
+    if (o.qr) {
+      const b = Object.assign(document.createElement('button'), { textContent: 'Show QR' });
+      b.onclick = () => showQR(o.id);
+      el.append(b);
+    }
+    $('orders').append(el);
+  }
+  const newest = list.find(o => o.qr);
+  if (openNewest && newest) showQR(newest.id);
+}
+$('ordRefresh').onclick = () => loadOrders();
 
 async function load() {
   state = await api('/api/state');
@@ -137,7 +214,6 @@ async function load() {
   if (!state.log.length) $('log').innerHTML = '<div class="muted">Nothing yet.</div>';
   loadMenu();
 }
-
 let menuSeq = 0;
 async function loadMenu() {
   const seq = ++menuSeq;
@@ -158,17 +234,32 @@ async function loadMenu() {
         <input class="qty" type="number" min="1" max="5" value="1" aria-label="Quantity">
         <button class="buy">Buy</button>
       </div>
+      <div class="msg"></div>
       <label class="auto"><input type="checkbox" ${ruled ? 'checked' : ''}> Auto-buy when in stock</label>`;
     el.querySelector('.n').textContent = it.name;
     el.querySelector('.i').textContent = `Rs ${it.price.toFixed(2)}  ·  ${it.stock > 0 ? it.stock + ' in stock' : 'not ready yet'}${it.info ? '  ·  ' + it.info : ''}`;
-    const buyBtn = el.querySelector('.buy'), qty = el.querySelector('.qty');
+    const buyBtn = el.querySelector('.buy'), qty = el.querySelector('.qty'), msg = el.querySelector('.msg');
     buyBtn.disabled = it.stock <= 0;
     buyBtn.onclick = async () => {
-      if (!confirm(`Buy ${qty.value} x ${it.name} from your wallet?`)) return;
+      const n = Math.max(1, Math.min(5, Number(qty.value) || 1));
+      if (!armed(buyBtn, `Confirm Rs ${(n * it.price).toFixed(0)}`)) return;
       buyBtn.disabled = true;
-      try { const r = await api('/api/buy', { meal, id: it.id, qty: Number(qty.value) }); alert('Order placed: ' + r.receipt); }
-      catch (err) { alert(err.message); }
-      load();
+      buyBtn.textContent = 'Buying...';
+      msg.className = 'msg';
+      msg.textContent = 'Placing order...';
+      try {
+        const r = await api('/api/buy', { meal, id: it.id, qty: n });
+        msg.className = 'msg ok';
+        msg.textContent = 'Order placed: ' + r.receipt;
+        loadOrders(true);
+        const s = await api('/api/state');
+        $('bal').textContent = `${s.reg}  ·  Wallet Rs ${(s.balance || 0).toFixed(2)}`;
+      } catch (err) {
+        msg.className = 'msg bad';
+        msg.textContent = err.message;
+      }
+      buyBtn.disabled = false;
+      buyBtn.textContent = 'Buy';
     };
     el.querySelector('.auto input').onchange = e => {
       const rules = state.rules.filter(r => !(r.meal === meal && r.id === it.id));
@@ -192,12 +283,12 @@ function renderRules() {
 }
 
 async function saveRules(rules) {
-  try { await api('/api/rules', { rules }); } catch (err) { alert(err.message); }
+  try { await api('/api/rules', { rules }); } catch (err) { $('autoNote').textContent = err.message; }
   state = await api('/api/state');
   renderRules();
 }
 
-load().catch(() => show(false));
+load().then(() => loadOrders()).catch(() => show(false));
 </script>
 </body>
 </html>
