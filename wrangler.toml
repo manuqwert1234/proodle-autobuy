@@ -9,4 +9,4 @@ crons = ["* 0-16 * * *"]   # every minute, 05:30-22:30 IST (cron is UTC)
 [[d1_databases]]
 binding = "DB"
 database_name = "proodle"
-database_id = "DATABASE_ID"
+database_id = "46527c98-0527-4216-8161-26fa0acdf625"
