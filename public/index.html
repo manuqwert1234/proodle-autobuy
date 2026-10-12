@@ -107,7 +107,7 @@ $('loginForm').onsubmit = async e => {
 };
 
 $('logout').onclick = async () => {
-  if (!confirm('Sign out and delete your saved PIN and auto-buy items from this server?')) return;
+  if (!confirm('Sign out and delete your saved PIN and auto-buy items?')) return;
   await api('/api/forget', {});
   show(false);
 };
@@ -117,7 +117,7 @@ async function load() {
   show(true);
   $('who').textContent = state.name;
   $('bal').textContent = state.balance == null ? state.reg : `${state.reg}  ·  Wallet Rs ${state.balance.toFixed(2)}`;
-  $('autoNote').textContent = `Checked every ${state.poll} seconds while this server runs. Each item is bought at most once a day.`;
+  $('autoNote').textContent = `Checked every minute from 5:30 AM to 10:30 PM, even when your phone and laptop are off. Each item is bought at most once a day.`;
   $('tabs').innerHTML = '';
   for (const [id, name] of Object.entries(state.meals)) {
     const b = document.createElement('button');

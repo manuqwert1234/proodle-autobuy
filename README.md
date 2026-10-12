@@ -1,33 +1,29 @@
 # Proodle auto-buy
 
-Buys your VIT mess food from your Proodle wallet as soon as it is in stock.
-Runs on GitHub Actions every 5 minutes (05:30 to 22:30 IST), so your laptop can be off.
+A faster front end for VIT Proodle. Sign in with your registration number and PIN, see today's
+breakfast, lunch, snacks and dinner with live stock, buy in one tap, or tick items to
+**auto-buy the moment they are in stock**.
 
-## What to buy: edit `rules.json`
+Runs free on Cloudflare Workers. A 1-minute schedule (05:30 to 22:30 IST) does the auto-buying,
+so your phone and laptop can be off.
 
-```json
-[
-  {"meal": "Lunch",  "item": "veg meals", "qty": 1},
-  {"meal": "Dinner", "item": "chapathi",  "qty": 1}
-]
+- Each auto-buy item is bought at most once a day. Overlapping runs can't double-buy.
+- A failed payment (wrong PIN, low balance) stops that item for the day instead of retrying.
+- If a payment gets no reply, it is not retried. Check My Orders on Proodle.
+
+## Files
+
+- `worker.js`: the Proodle API client, the auto-buy check and the web routes
+- `public/index.html`: the site
+- `schema.sql`: the one D1 table
+- `test.mjs`: offline self-check with a fake Proodle (`npm test`)
+
+## Deploy your own
+
 ```
-
-- `meal`: Breakfast, Lunch, Snacks or Dinner
-- `item`: any part of the item name as it appears on Proodle (not case sensitive)
-- `qty`: 1 to 5
-
-Each item is bought at most once a day. Every run prints today's menu, with stock counts, in the Actions log.
-Use those names in `rules.json`.
-
-## Login
-
-Repo Settings > Secrets and variables > Actions:
-
-- `PROODLE_REG`: registration / application number
-- `PROODLE_PIN`: PIN
-- `PROODLE_WPIN`: wallet PIN, only if it differs from the login PIN
-
-## Run it on your own computer instead
-
-`python3 proodle.py`, then open http://localhost:8765. You get a menu, a buy button and auto-buy checkboxes.
-`python3 proodle.py test` runs an offline self-check.
+npm install
+npx wrangler login
+npx wrangler d1 create proodle         # put the printed database_id in wrangler.toml
+npx wrangler d1 execute proodle --remote --file schema.sql
+npx wrangler deploy
+```
