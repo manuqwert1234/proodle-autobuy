@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mess Auto-Buy</title>
+<style>
+  :root { --bg:#f6f7f8; --card:#fff; --text:#1d2327; --muted:#69737b; --line:#e2e5e8; --accent:#0b7f86; --bad:#b3261e; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#121416; --card:#1b1e21; --text:#e6e8ea; --muted:#99a2aa; --line:#2b2f33; --accent:#4fb8be; --bad:#f2827a; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:15px/1.45 -apple-system, system-ui, sans-serif; }
+  main { max-width:560px; margin:0 auto; padding:16px; }
+  h1 { font-size:20px; margin:8px 0 16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px; margin-bottom:12px; }
+  label { display:block; font-size:13px; color:var(--muted); margin:10px 0 4px; }
+  input { width:100%; padding:11px; font-size:16px; border:1px solid var(--line); border-radius:8px; background:var(--bg); color:var(--text); }
+  button { padding:10px 14px; font-size:15px; border:0; border-radius:8px; background:var(--accent); color:#fff; cursor:pointer; }
+  button.ghost { background:none; color:var(--accent); border:1px solid var(--line); }
+  button:disabled { opacity:.5; }
+  .row { display:flex; align-items:center; gap:10px; }
+  .grow { flex:1; min-width:0; }
+  .muted { color:var(--muted); font-size:13px; }
+  .err { color:var(--bad); min-height:1.2em; }
+  .tabs { display:flex; gap:6px; margin-bottom:12px; }
+  .tabs button { flex:1; background:var(--card); color:var(--text); border:1px solid var(--line); padding:9px 4px; }
+  .tabs button.on { background:var(--accent); color:#fff; border-color:var(--accent); }
+  .item { padding:10px 0; border-top:1px solid var(--line); }
+  .item:first-child { border-top:0; }
+  .qty { width:56px; padding:8px; text-align:center; }
+  .auto { font-size:13px; color:var(--muted); display:flex; align-items:center; gap:6px; margin-top:6px; }
+  .auto input { width:auto; }
+  #log div { font-size:13px; padding:4px 0; border-top:1px solid var(--line); font-variant-numeric:tabular-nums; }
+  .hide { display:none; }
+</style>
+</head>
+<body>
+<main>
+  <section id="loginView" class="hide">
+    <h1>Mess Auto-Buy</h1>
+    <form class="card" id="loginForm">
+      <label for="reg">Registration / application number</label>
+      <input id="reg" inputmode="numeric" autocomplete="username" maxlength="10" required>
+      <label for="pin">PIN</label>
+      <input id="pin" type="password" inputmode="numeric" autocomplete="current-password" maxlength="6" required>
+      <label for="wpin">Wallet PIN (only if different from your login PIN)</label>
+      <input id="wpin" type="password" inputmode="numeric" maxlength="6">
+      <p class="err" id="loginErr"></p>
+      <button id="loginBtn" style="width:100%">Sign in</button>
+      <p class="muted">Signing in here closes any open Proodle session on your phone, the same as the official site does.</p>
+    </form>
+  </section>
+
+  <section id="appView" class="hide">
+    <div class="row" style="margin:8px 0 14px">
+      <div class="grow"><h1 style="margin:0" id="who"></h1><div class="muted" id="bal"></div></div>
+      <button class="ghost" id="logout">Sign out</button>
+    </div>
+
+    <div class="tabs" id="tabs"></div>
+    <div class="card">
+      <div class="muted" id="menuNote"></div>
+      <div id="menu"></div>
+    </div>
+
+    <div class="card">
+      <strong>Auto-buy</strong>
+      <p class="muted" id="autoNote" style="margin:4px 0 0"></p>
+      <div id="rules"></div>
+    </div>
+
+    <div class="card">
+      <strong>Activity</strong>
+      <div id="log"></div>
+    </div>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+let state = null, meal = Number(localStorage.getItem('meal') || 2), menuItems = [];
+
+async function api(path, body) {
+  const r = await fetch(path, body ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : {});
+  const j = await r.json().catch(() => ({ error: 'Server not responding' }));
+  if (r.status === 401) { show(false); throw new Error(j.error); }
+  if (!r.ok) throw new Error(j.error || 'Something went wrong');
+  return j;
+}
+
+function show(loggedIn) {
+  $('loginView').classList.toggle('hide', loggedIn);
+  $('appView').classList.toggle('hide', !loggedIn);
+}
+
+$('loginForm').onsubmit = async e => {
+  e.preventDefault();
+  $('loginErr').textContent = '';
+  $('loginBtn').disabled = true;
+  try {
+    await api('/api/login', { reg: $('reg').value, pin: $('pin').value, wpin: $('wpin').value });
+    $('pin').value = $('wpin').value = '';
+    await load();
+  } catch (err) { $('loginErr').textContent = err.message; }
+  $('loginBtn').disabled = false;
+};
+
+$('logout').onclick = async () => {
+  if (!confirm('Sign out and delete your saved PIN and auto-buy items from this server?')) return;
+  await api('/api/forget', {});
+  show(false);
+};
+
+async function load() {
+  state = await api('/api/state');
+  show(true);
+  $('who').textContent = state.name;
+  $('bal').textContent = state.balance == null ? state.reg : `${state.reg}  ·  Wallet Rs ${state.balance.toFixed(2)}`;
+  $('autoNote').textContent = `Checked every ${state.poll} seconds while this server runs. Each item is bought at most once a day.`;
+  $('tabs').innerHTML = '';
+  for (const [id, name] of Object.entries(state.meals)) {
+    const b = document.createElement('button');
+    b.textContent = name;
+    b.className = Number(id) === meal ? 'on' : '';
+    b.onclick = () => { meal = Number(id); localStorage.setItem('meal', meal); load(); };
+    $('tabs').append(b);
+  }
+  renderRules();
+  $('log').innerHTML = '';
+  for (const line of state.log.slice(0, 15)) {
+    const d = document.createElement('div'); d.textContent = line; $('log').append(d);
+  }
+  if (!state.log.length) $('log').innerHTML = '<div class="muted">Nothing yet.</div>';
+  loadMenu();
+}
+
+async function loadMenu() {
+  $('menuNote').textContent = 'Loading menu...';
+  $('menu').innerHTML = '';
+  try { menuItems = await api('/api/menu?meal=' + meal); }
+  catch (err) { $('menuNote').textContent = err.message; return; }
+  $('menuNote').textContent = menuItems.length ? `Today's ${state.meals[meal].toLowerCase()}` : `No ${state.meals[meal].toLowerCase()} items listed yet. You can still auto-buy once they appear; add them from here when they show.`;
+  for (const it of menuItems) {
+    const el = document.createElement('div');
+    el.className = 'item';
+    const ruled = state.rules.some(r => r.meal === meal && r.id === it.id);
+    el.innerHTML = `
+      <div class="row">
+        <div class="grow"><div class="n"></div><div class="muted i"></div></div>
+        <input class="qty" type="number" min="1" max="5" value="1" aria-label="Quantity">
+        <button class="buy">Buy</button>
+      </div>
+      <label class="auto"><input type="checkbox" ${ruled ? 'checked' : ''}> Auto-buy when in stock</label>`;
+    el.querySelector('.n').textContent = it.name;
+    el.querySelector('.i').textContent = `Rs ${it.price.toFixed(2)}  ·  ${it.stock > 0 ? it.stock + ' in stock' : 'not ready yet'}${it.info ? '  ·  ' + it.info : ''}`;
+    const buyBtn = el.querySelector('.buy'), qty = el.querySelector('.qty');
+    buyBtn.disabled = it.stock <= 0;
+    buyBtn.onclick = async () => {
+      if (!confirm(`Buy ${qty.value} x ${it.name} from your wallet?`)) return;
+      buyBtn.disabled = true;
+      try { const r = await api('/api/buy', { meal, id: it.id, qty: Number(qty.value) }); alert('Order placed: ' + r.receipt); }
+      catch (err) { alert(err.message); }
+      load();
+    };
+    el.querySelector('.auto input').onchange = e => {
+      const rules = state.rules.filter(r => !(r.meal === meal && r.id === it.id));
+      if (e.target.checked) rules.push({ meal, id: it.id, name: it.name, qty: Number(qty.value) || 1 });
+      saveRules(rules);
+    };
+    $('menu').append(el);
+  }
+}
+
+function renderRules() {
+  $('rules').innerHTML = state.rules.length ? '' : '<p class="muted">No auto-buy items. Tick "Auto-buy when in stock" on any menu item.</p>';
+  for (const r of state.rules) {
+    const el = document.createElement('div');
+    el.className = 'item row';
+    el.innerHTML = '<div class="grow"></div><button class="ghost">Remove</button>';
+    el.firstChild.textContent = `${state.meals[r.meal]}: ${r.qty} x ${r.name}`;
+    el.querySelector('button').onclick = () => saveRules(state.rules.filter(x => x !== r));
+    $('rules').append(el);
+  }
+}
+
+async function saveRules(rules) {
+  try { await api('/api/rules', { rules }); } catch (err) { alert(err.message); }
+  state = await api('/api/state');
+  renderRules();
+}
+
+load().catch(() => show(false));
+</script>
+</body>
+</html>
