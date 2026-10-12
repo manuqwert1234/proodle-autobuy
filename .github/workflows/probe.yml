@@ -1,0 +1,10 @@
+name: probe
+on: workflow_dispatch
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          curl -s https://www.cloudflare.com/cdn-cgi/trace | grep -E "loc|colo"
+          curl -s -o out.txt -w "proodle status %{http_code}\n" -X POST https://vit-proodle.expertsoftsys.com/api/getprefers -H 'Content-Type: application/json' -d '{"DocumentNo":"2"}'
+          head -c 120 out.txt; echo
