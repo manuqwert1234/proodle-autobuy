@@ -2,7 +2,8 @@
 // The site (public/index.html) shows today's menu with live stock, buys in one tap,
 // and lets you tick items to auto-buy. A 1-minute cron buys them the moment they are in stock.
 // Storage: one D1 table kv(k, v). Keys: users, user:<reg>, tok:<token>,
-// day:<day>:done:<reg>:<meal>:<item> (bought today), day:<day>:open:<reg>:<meal> (open alert sent today).
+// day:<day>:done:<reg>:<meal>:<item> (bought today), day:<day>:open:<reg>:<meal> (open alert sent today),
+// times:<outlet> (learned meal start/end times).
 
 const BASE = "https://vit-proodle.expertsoftsys.com";
 const MEALS = { 1: "Breakfast", 2: "Lunch", 3: "Snacks", 4: "Dinner" };
@@ -143,44 +144,92 @@ const notify = (u, text) => u.alerts
   ? fetch("https://ntfy.sh/" + u.alerts, { method: "POST", body: text, headers: { Title: "Mess Auto-Buy" } }).catch(() => {})
   : null;
 
-export async function watch(env) {
+// Meal timetable: Proodle items carry StartTime/EndTime ("/Date(ms)/"). Only the open meal is listed,
+// so each meal's times are learned the first time it is seen, per outlet, and kept in times:<outlet>.
+function tod(v) {
+  const ms = Number(/\d{9,}/.exec(String(v || ""))?.[0]);
+  if (!ms) return null;
+  const d = new Date(ms + 5.5 * 3600e3);
+  return `${String(d.getUTCHours()).padStart(2, "0")}:${String(d.getUTCMinutes()).padStart(2, "0")}`;
+}
+
+async function learn(env, u, meal, list) {
+  const start = tod(list[0]?.StartTime), end = tod(list[0]?.EndTime);
+  if (!start || !u.s) return;
+  const key = "times:" + u.s.P2, t = (await get(env, key)) || {};
+  if (t[meal]?.start === start && t[meal]?.end === end) return;
+  t[meal] = { start, end };
+  await put(env, key, t);
+}
+
+// seconds since this meal's start time today (negative = before it opens)
+function sinceStart(t) {
+  if (!t?.start) return null;
+  const [h, m] = t.start.split(":").map(Number), n = istNow();
+  return n.getUTCHours() * 3600 + n.getUTCMinutes() * 60 + n.getUTCSeconds() - (h * 3600 + m * 60);
+}
+
+// Alert + auto-buy for one user and one meal, given that meal's current menu.
+async function checkMeal(env, u, day, meal, list) {
+  const reg = u.reg;
+  const ready = list.filter(p => stock(p) > 0);
+  if (u.alerts && ready.length && await claim(env, `day:${day}:open:${reg}:${meal}`))   // "Dinner is open" once a day
+    await notify(u, `${MEALS[meal]} is open: ${ready.length} items, e.g. ${ready.slice(0, 3).map(p => p.meitdes).join(", ")}`);
+  for (const rule of (u.rules || []).filter(r => r.meal === meal)) {
+    try {
+      const p = list.find(p => String(p.meitid) === rule.id)         // by id, or by name if Proodle renumbered it
+        || list.find(p => String(p.meitdes).trim().toLowerCase() === rule.name.trim().toLowerCase());
+      if (!p || stock(p) < rule.qty) continue;                         // not ready yet
+      const key = `day:${day}:done:${reg}:${rule.meal}:${rule.id}`;
+      if (!(await claim(env, key))) continue;                           // already bought today
+      let msg;
+      try {
+        msg = `AUTO-BOUGHT ${MEALS[rule.meal]}: ${(await buy(env, u, rule.meal, p.meitid, rule.qty)).text}`;
+      } catch (e) {
+        if (!(e instanceof Err) || e.retry) { await del(env, key); throw e; } // safe to try again shortly
+        msg = `Auto-buy ${rule.name} stopped for today: ${e.message}`;
+      }
+      await update(env, reg, x => note(x, msg));
+      await notify(u, msg);
+    } catch (e) {
+      console.log("watch", reg, rule.name, e.message);
+    }
+  }
+}
+
+export async function watch(env, t0 = Date.now()) {
+  const RUSH_EVERY = env.RUSH_EVERY ?? 5000, RUSH_UNTIL = env.RUSH_UNTIL ?? 50000;
   const { day } = today();
   await env.DB.prepare("DELETE FROM kv WHERE k LIKE 'day:%' AND k < ?").bind("day:" + day).run();
+  const rush = [];                                                      // [user, meal] near opening time
   for (const reg of (await get(env, "users")) || []) {
     const u = await get(env, "user:" + reg);
     if (!u || (!u.rules?.length && !u.alerts)) continue;
-    const menus = {};
-    const menu = async meal => (menus[meal] ??= await rawMenu(env, u, meal));
-
-    if (u.alerts) for (const meal of [1, 2, 3, 4]) {                   // "Dinner is open" once a day
+    const times = u.s ? (await get(env, "times:" + u.s.P2)) || {} : {};
+    const meals = u.alerts ? [1, 2, 3, 4] : [...new Set(u.rules.map(r => r.meal))];
+    for (const meal of meals) {
       try {
-        const ready = (await menu(meal)).filter(p => stock(p) > 0);
-        if (ready.length && await claim(env, `day:${day}:open:${reg}:${meal}`))
-          await notify(u, `${MEALS[meal]} is open: ${ready.length} items, e.g. ${ready.slice(0, 3).map(p => p.meitdes).join(", ")}`);
+        const list = await rawMenu(env, u, meal);
+        if (list.length) await learn(env, u, meal, list);
+        await checkMeal(env, u, day, meal, list);
+        const t = sinceStart(times[meal]);
+        if (t !== null && t >= -60 && t <= 120) rush.push([u, meal]);
       } catch (e) {
-        console.log("watch open", reg, meal, e.message);
+        console.log("watch meal", reg, meal, e.message);
       }
     }
-
-    for (const rule of u.rules || []) {
+  }
+  // Cloudflare starts us once a minute. Around a meal's opening time, keep re-checking every few
+  // seconds for the rest of this minute so ticked items are bought within seconds of opening.
+  // ponytail: ~10 Proodle calls per rushing user per minute; free plan allows 50 per run, so a
+  // handful of users rush fine; with many users split the run per user (service binding / queue).
+  while (rush.length && Date.now() - t0 < RUSH_UNTIL) {
+    await new Promise(r => setTimeout(r, RUSH_EVERY));
+    for (const [u, meal] of rush) {
       try {
-        const list = await menu(rule.meal);
-        const p = list.find(p => String(p.meitid) === rule.id)       // by id, or by name if Proodle renumbered it
-          || list.find(p => String(p.meitdes).trim().toLowerCase() === rule.name.trim().toLowerCase());
-        if (!p || stock(p) < rule.qty) continue;                       // not ready yet
-        const key = `day:${day}:done:${reg}:${rule.meal}:${rule.id}`;
-        if (!(await claim(env, key))) continue;                         // already bought today
-        let msg;
-        try {
-          msg = `AUTO-BOUGHT ${MEALS[rule.meal]}: ${(await buy(env, u, rule.meal, p.meitid, rule.qty)).text}`;
-        } catch (e) {
-          if (!(e instanceof Err) || e.retry) { await del(env, key); throw e; } // safe to try again next minute
-          msg = `Auto-buy ${rule.name} stopped for today: ${e.message}`;
-        }
-        await update(env, reg, x => note(x, msg));
-        await notify(u, msg);
+        await checkMeal(env, u, day, meal, await rawMenu(env, u, meal));
       } catch (e) {
-        console.log("watch", reg, rule.name, e.message);
+        console.log("rush", u.reg, meal, e.message);
       }
     }
   }
@@ -234,10 +283,14 @@ async function route(req, env) {
 
   if (path === "/api/state")
     return json({ name: u.s?.P5 || u.reg, reg: u.reg, balance: await balance(u).catch(() => null),
-                  rules: u.rules || [], log: u.log || [], meals: MEALS, poll: 60, alerts: u.alerts || "" });
-  if (path === "/api/menu")
-    return json((await rawMenu(env, u, Number(q.meal) || 1)).map(p => ({
+                  rules: u.rules || [], log: u.log || [], meals: MEALS, poll: 60, alerts: u.alerts || "",
+                  times: u.s ? (await get(env, "times:" + u.s.P2)) || {} : {} });
+  if (path === "/api/menu") {
+    const meal = Number(q.meal) || 1, list = await rawMenu(env, u, meal);
+    if (list.length) await learn(env, u, meal, list);
+    return json(list.map(p => ({
       id: String(p.meitid), name: p.meitdes, price: Number(p.retrt), stock: stock(p), info: p.dispname || "" })));
+  }
   if (path === "/api/buy") {
     const meal = Number(q.meal), qty = Math.max(1, Math.min(5, parseInt(q.qty) || 1));
     try {

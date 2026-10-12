@@ -30,7 +30,11 @@ globalThis.fetch = async (url, init = {}) => {
     "/api/GetOTPChecking": () => body.OtpNo === "1234"
       ? JSON.stringify([{ OtpSts: "Success|0|x|x|x|NAME|M123|5", ouid: 9, ctrid: 1, logid: 5 }]) // double-encoded, like the real API
       : [{ OtpSts: "Fail" }],
-    "/api/GetOptionMenuItems": () => (assert.match(body.odt, /^\d\d-[A-Z][a-z]{2}-\d{4}$/), [{ ...item, StockQty: st.stock }]),
+    "/api/GetOptionMenuItems": () => {
+      assert.match(body.odt, /^\d\d-[A-Z][a-z]{2}-\d{4}$/);
+      const n = calls.filter(c => c === "/api/GetOptionMenuItems").length;
+      return [{ ...item, StockQty: st.stockAfter && n >= st.stockAfter ? 5 : st.stock, StartTime: st.start, EndTime: st.end }];
+    },
     "/api/getexgstval": () => 3,
     "/api/GetOrderIdDetails": () => [{ OrderNo: "O1" }],
     "/api/GetOutletListInsert": () => {
@@ -120,6 +124,20 @@ for (const k of [...m.keys()]) if (k.includes(":done:")) m.delete(k);
 const before = pays();
 await watch(env);
 assert.equal(pays(), before + 1);
+
+// meal timetable is learned; around opening time it re-checks every few seconds inside the same run
+const startMs = Date.now() - 30e3;
+st.start = `/Date(${startMs})/`; st.end = `/Date(${startMs + 3600e3})/`;
+for (const k of [...m.keys()]) if (k.includes(":done:")) m.delete(k);
+st.stock = 0; st.pay = "1|B46";
+await watch(env);                                   // learns times; nothing in stock yet
+assert.match(JSON.parse(m.get("times:9"))[2].start, /^\d\d:\d\d$/);
+assert.ok((await (await req("/api/state", null, ck)).json()).times[2].end);
+const p0 = pays();
+st.stockAfter = calls.filter(c => c === "/api/GetOptionMenuItems").length + 4;   // food appears a few checks later
+await watch({ DB, RUSH_EVERY: 1, RUSH_UNTIL: 500 });
+assert.equal(pays(), p0 + 1);                       // bought within the same minute, not on the next run
+st.stockAfter = 0; st.start = st.end = undefined;
 
 // My orders + QR (only your own orders)
 const ords = await (await req("/api/orders", null, ck)).json();
