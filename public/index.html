@@ -82,7 +82,10 @@ const $ = id => document.getElementById(id);
 let state = null, meal = Number(localStorage.getItem('meal') || 2), menuItems = [];
 
 async function api(path, body) {
-  const r = await fetch(path, body ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : {});
+  const opts = body ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : {};
+  // a dropped connection on a read is retried once; POSTs (buy) never are
+  const r = await fetch(path, opts).catch(e => body ? Promise.reject(e) : new Promise(ok => setTimeout(ok, 1000)).then(() => fetch(path, opts)))
+    .catch(() => { throw new Error('Connection problem. Check your internet and try again.'); });
   const j = await r.json().catch(() => ({ error: 'Server not responding' }));
   if (r.status === 401) { show(false); throw new Error(j.error); }
   if (!r.ok) throw new Error(j.error || 'Something went wrong');
@@ -135,11 +138,15 @@ async function load() {
   loadMenu();
 }
 
+let menuSeq = 0;
 async function loadMenu() {
+  const seq = ++menuSeq;
   $('menuNote').textContent = 'Loading menu...';
   $('menu').innerHTML = '';
   try { menuItems = await api('/api/menu?meal=' + meal); }
-  catch (err) { $('menuNote').textContent = err.message; return; }
+  catch (err) { if (seq === menuSeq) $('menuNote').textContent = err.message; return; }
+  if (seq !== menuSeq) return; // a newer tab was tapped meanwhile; only the latest one draws
+  $('menu').innerHTML = '';
   $('menuNote').textContent = menuItems.length ? `Today's ${state.meals[meal].toLowerCase()}` : `No ${state.meals[meal].toLowerCase()} items listed yet. You can still auto-buy once they appear; add them from here when they show.`;
   for (const it of menuItems) {
     const el = document.createElement('div');
