@@ -8,7 +8,7 @@ const DB = { prepare: sql => ({ bind: (...a) => ({
   run: async () => {
     if (sql.startsWith("INSERT OR IGNORE")) { const c = m.has(a[0]) ? 0 : 1; m.set(a[0], "1"); return { meta: { changes: c } }; }
     if (sql.startsWith("INSERT INTO")) { m.set(a[0], a[1]); return { meta: { changes: 1 } }; }
-    if (sql.includes("LIKE")) { for (const k of [...m.keys()]) if (k.startsWith("done:") && k < a[0]) m.delete(k); return { meta: {} }; }
+    if (sql.includes("LIKE")) { for (const k of [...m.keys()]) if (k.startsWith("day:") && k < a[0]) m.delete(k); return { meta: {} }; }
     if (sql.startsWith("DELETE")) { m.delete(a[0]); return { meta: {} }; }
     throw new Error(sql);
   },
@@ -20,7 +20,9 @@ const RAW = "\0raw:";
 const st = { stock: 0, pay: "1|B42" };
 const item = { meitid: 7, meitdes: "Veg Meals", retrt: "60.00", skuid: 3, tb: "2", type: "V",
                dispname: "Rice, dal", itmsdes: "", odtdes: "LUNCH" };
+const alerts = [];
 globalThis.fetch = async (url, init = {}) => {
+  if (url.startsWith("https://ntfy.sh/")) { alerts.push(init.body); return new Response("{}"); }
   const path = new URL(url).pathname, body = init.body && JSON.parse(init.body);
   calls.push(path);
   await new Promise(r => setTimeout(r, 1)); // let overlapping runs interleave
@@ -77,19 +79,38 @@ await watch(env);                                   // same day: never again
 assert.equal(pays(), 1);
 assert.equal(calls.filter(c => c === "/api/GetOTPChecking").length, logins); // session reused, no re-login
 
-for (const k of [...m.keys()]) if (k.startsWith("done:")) m.delete(k);
+for (const k of [...m.keys()]) if (k.includes(":done:")) m.delete(k);
 st.pay = "6|";
 await watch(env); await watch(env);                 // wrong wallet PIN: stops for the day, no retry loop
 assert.equal(pays(), 2);
 assert.match(log()[0], /Wrong wallet PIN/);
 
-for (const k of [...m.keys()]) if (k.startsWith("done:")) m.delete(k);
+for (const k of [...m.keys()]) if (k.includes(":done:")) m.delete(k);
 st.pay = "9|";
 await watch(env);                                   // sold out at pay time: tries again next minute
 st.pay = "1|B44";
 await watch(env);
 assert.equal(pays(), 4);
 assert.match(log()[0], /bill B44/);
+
+// phone alerts: meal-open once a day, and every auto-buy
+const on = await (await req("/api/alerts", { on: true }, ck)).json();
+assert.match(on.alerts, /^proodle-[0-9a-f]{20}$/);
+alerts.length = 0;
+for (const k of [...m.keys()]) if (k.includes(":done:")) m.delete(k);
+st.pay = "1|B45";
+await watch(env); await watch(env);
+assert.equal(alerts.filter(a => /Lunch is open: 1 items, e.g. Veg Meals/.test(a)).length, 1, alerts.join("|"));
+assert.equal(alerts.filter(a => /AUTO-BOUGHT Lunch/.test(a)).length, 1);
+assert.equal(alerts.filter(a => / is open: /.test(a)).length, 4);   // fake lists all 4 meals: one alert each, not repeated next minute
+assert.equal((await (await req("/api/alerts", { on: false }, ck)).json()).alerts, "");
+
+// renamed id: still found by name
+const u0 = JSON.parse(m.get("user:2023000000")); u0.rules[0].id = "999"; m.set("user:2023000000", JSON.stringify(u0));
+for (const k of [...m.keys()]) if (k.includes(":done:")) m.delete(k);
+const before = pays();
+await watch(env);
+assert.equal(pays(), before + 1);
 
 // My orders + QR (only your own orders)
 const ords = await (await req("/api/orders", null, ck)).json();

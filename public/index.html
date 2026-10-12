@@ -92,6 +92,11 @@
     </div>
 
     <div class="card">
+      <strong>Phone alerts</strong>
+      <div id="alerts"></div>
+    </div>
+
+    <div class="card">
       <strong>Activity</strong>
       <div id="log"></div>
     </div>
@@ -208,6 +213,7 @@ async function load() {
     $('tabs').append(b);
   }
   renderRules();
+  renderAlerts();
   $('log').innerHTML = '';
   for (const line of state.log.slice(0, 15)) {
     const d = document.createElement('div'); d.textContent = line; $('log').append(d);
@@ -224,7 +230,9 @@ async function loadMenu() {
   catch (err) { if (seq === menuSeq) $('menuNote').textContent = err.message; return; }
   if (seq !== menuSeq) return; // a newer tab was tapped meanwhile; only the latest one draws
   $('menu').innerHTML = '';
-  $('menuNote').textContent = menuItems.length ? `Today's ${state.meals[meal].toLowerCase()}` : `No ${state.meals[meal].toLowerCase()} items listed yet. You can still auto-buy once they appear; add them from here when they show.`;
+  const mname = state.meals[meal];
+  $('menuNote').textContent = menuItems.length ? `Today's ${mname.toLowerCase()}`
+    : `${mname} isn't open right now. Proodle only lists each meal during its serving time. Turn on Phone alerts below to get a notification the moment it opens, then tick what you want. Ticked items are bought automatically every day after that.`;
   for (const it of menuItems) {
     const el = document.createElement('div');
     el.className = 'item';
@@ -273,6 +281,31 @@ async function loadMenu() {
     };
     $('menu').append(el);
   }
+}
+
+function renderAlerts() {
+  const box = $('alerts');
+  if (!state.alerts) {
+    box.innerHTML = '<p class="muted">Get a notification on your phone when each meal opens, and whenever something is auto-bought. Free, no signup.</p><button id="alOn">Turn on</button>';
+    $('alOn').onclick = () => setAlerts(true);
+    return;
+  }
+  box.innerHTML = `<ol class="muted" style="padding-left:18px;margin:8px 0">
+      <li>Install the free <b>ntfy</b> app: <a href="https://apps.apple.com/app/ntfy/id1625396347">iPhone</a> or <a href="https://play.google.com/store/apps/details?id=io.heckel.ntfy">Android</a>.</li>
+      <li>Open it, tap <b>+</b>, and subscribe to this topic (keep it private):</li>
+    </ol>
+    <p><code id="alTopic" style="font-size:16px;user-select:all"></code> <button class="ghost" id="alCopy">Copy</button></p>
+    <div class="row"><button class="ghost" id="alTest">Send test alert</button><button class="ghost" id="alOff">Turn off</button></div>
+    <p class="msg" id="alMsg"></p>`;
+  $('alTopic').textContent = state.alerts;
+  $('alCopy').onclick = () => navigator.clipboard?.writeText(state.alerts).then(() => { $('alMsg').textContent = 'Copied.'; }, () => {});
+  $('alTest').onclick = async () => { await setAlerts('test'); $('alMsg').textContent = 'Test sent. Did your phone get it?'; };
+  $('alOff').onclick = e => { if (armed(e.target, 'Tap again to turn off')) setAlerts(false); };
+}
+
+async function setAlerts(on) {
+  try { state.alerts = (await api('/api/alerts', { on })).alerts; } catch (err) { $('alerts').textContent = err.message; return; }
+  renderAlerts();
 }
 
 function renderRules() {

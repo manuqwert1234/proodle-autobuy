@@ -1,7 +1,8 @@
 // VIT Proodle auto-buyer on Cloudflare Workers.
 // The site (public/index.html) shows today's menu with live stock, buys in one tap,
 // and lets you tick items to auto-buy. A 1-minute cron buys them the moment they are in stock.
-// Storage: one D1 table kv(k, v). Keys: users, user:<reg>, tok:<token>, done:<day>:<reg>:<meal>:<item>.
+// Storage: one D1 table kv(k, v). Keys: users, user:<reg>, tok:<token>,
+// day:<day>:done:<reg>:<meal>:<item> (bought today), day:<day>:open:<reg>:<meal> (open alert sent today).
 
 const BASE = "https://vit-proodle.expertsoftsys.com";
 const MEALS = { 1: "Breakfast", 2: "Lunch", 3: "Snacks", 4: "Dinner" };
@@ -141,28 +142,47 @@ async function buy(env, u, meal, id, qty) {
 
 // ---------- auto-buy (every minute) ----------
 
+// Phone alert through the free ntfy app (user subscribes to their own random topic). Never throws.
+const notify = (u, text) => u.alerts
+  ? fetch("https://ntfy.sh/" + u.alerts, { method: "POST", body: text, headers: { Title: "Mess Auto-Buy" } }).catch(() => {})
+  : null;
+
 export async function watch(env) {
   const { day } = today();
-  await env.DB.prepare("DELETE FROM kv WHERE k LIKE 'done:%' AND k < ?").bind("done:" + day).run();
+  await env.DB.prepare("DELETE FROM kv WHERE k LIKE 'day:%' AND k < ?").bind("day:" + day).run();
   for (const reg of (await get(env, "users")) || []) {
     const u = await get(env, "user:" + reg);
-    if (!u?.rules?.length) continue;
+    if (!u || (!u.rules?.length && !u.alerts)) continue;
     const menus = {};
-    for (const rule of u.rules) {
+    const menu = async meal => (menus[meal] ??= await rawMenu(env, u, meal));
+
+    if (u.alerts) for (const meal of [1, 2, 3, 4]) {                   // "Dinner is open" once a day
       try {
-        menus[rule.meal] ??= await rawMenu(env, u, rule.meal);
-        const p = menus[rule.meal].find(p => String(p.meitid) === rule.id);
+        const ready = (await menu(meal)).filter(p => stock(p) > 0);
+        if (ready.length && await claim(env, `day:${day}:open:${reg}:${meal}`))
+          await notify(u, `${MEALS[meal]} is open: ${ready.length} items, e.g. ${ready.slice(0, 3).map(p => p.meitdes).join(", ")}`);
+      } catch (e) {
+        console.log("watch open", reg, meal, e.message);
+      }
+    }
+
+    for (const rule of u.rules || []) {
+      try {
+        const list = await menu(rule.meal);
+        const p = list.find(p => String(p.meitid) === rule.id)       // by id, or by name if Proodle renumbered it
+          || list.find(p => String(p.meitdes).trim().toLowerCase() === rule.name.trim().toLowerCase());
         if (!p || stock(p) < rule.qty) continue;                       // not ready yet
-        const key = `done:${day}:${reg}:${rule.meal}:${rule.id}`;
+        const key = `day:${day}:done:${reg}:${rule.meal}:${rule.id}`;
         if (!(await claim(env, key))) continue;                         // already bought today
         let msg;
         try {
-          msg = `AUTO-BOUGHT ${MEALS[rule.meal]}: ${(await buy(env, u, rule.meal, rule.id, rule.qty)).text}`;
+          msg = `AUTO-BOUGHT ${MEALS[rule.meal]}: ${(await buy(env, u, rule.meal, p.meitid, rule.qty)).text}`;
         } catch (e) {
           if (!(e instanceof Err) || e.retry) { await del(env, key); throw e; } // safe to try again next minute
           msg = `Auto-buy ${rule.name} stopped for today: ${e.message}`;
         }
         await update(env, reg, x => note(x, msg));
+        await notify(u, msg);
       } catch (e) {
         console.log("watch", reg, rule.name, e.message);
       }
@@ -210,7 +230,7 @@ async function route(req, env) {
 
   if (path === "/api/state")
     return json({ name: u.s?.P5 || u.reg, reg: u.reg, balance: await balance(u).catch(() => null),
-                  rules: u.rules || [], log: u.log || [], meals: MEALS, poll: 60 });
+                  rules: u.rules || [], log: u.log || [], meals: MEALS, poll: 60, alerts: u.alerts || "" });
   if (path === "/api/menu")
     return json((await rawMenu(env, u, Number(q.meal) || 1)).map(p => ({
       id: String(p.meitid), name: p.meitdes, price: Number(p.retrt), stock: stock(p), info: p.dispname || "" })));
@@ -246,6 +266,12 @@ async function route(req, env) {
       qty: Math.max(1, Math.min(5, parseInt(r.qty) || 1)) }));
     await update(env, reg, x => { x.rules = rules; });
     return json({ ok: true });
+  }
+  if (path === "/api/alerts") { // on: make a private random topic; off: forget it
+    const topic = q.on ? (u.alerts || "proodle-" + crypto.randomUUID().replace(/-/g, "").slice(0, 20)) : "";
+    await update(env, reg, x => { x.alerts = topic; });
+    if (topic) await notify({ alerts: topic }, q.on === "test" ? "Test alert from Mess Auto-Buy" : "Alerts are on. You'll hear when each meal opens and when something is auto-bought.");
+    return json({ ok: true, alerts: topic });
   }
   if (path === "/api/forget") { // sign out + delete stored PIN and rules
     await del(env, "user:" + reg);
